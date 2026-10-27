@@ -8,12 +8,16 @@ import (
 	"net/http"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/oklog/ulid/v2"
 )
 
 // 通知エンドポイントのポーリング間隔
 const notificationRetryAfterMs = 30
+
+// ライド完了後、nearby-chairs に椅子を返し始めるまでの猶予
+const nearbyChairsGracePeriod = time.Second
 
 type appPostUsersRequest struct {
 	Username       string  `json:"username"`
@@ -529,6 +533,22 @@ func appPostRideEvaluatation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// ベンチマーカーは評価APIの成功直後に支払い済みかを確認するので、決済が完了してから応答する
+	// Idempotency-Key にライドIDを使うので、評価APIが再送されても二重に決済されない
+	paymentGatewayRequest := &paymentGatewayPostPaymentRequest{
+		Amount: ride.fare(),
+	}
+	if err := requestPaymentGatewayPostPayment(ctx, gatewayURL, token, ride.ID, paymentGatewayRequest); err != nil {
+		if errors.Is(err, erroredUpstream) {
+			writeError(w, http.StatusBadGateway, err)
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	// 完了時刻は売上集計の基準になるので、決済のリトライを待った後に確定させる
+	// 先に確定すると、売上に反映される前に後続のライドの完了時刻が先行してしまう
 	completed := &rideStatusState{id: ulid.Make().String(), status: "COMPLETED", createdAt: now()}
 
 	tx, err := db.Beginx()
@@ -550,19 +570,6 @@ func appPostRideEvaluatation(w http.ResponseWriter, r *http.Request) {
 		ctx,
 		`INSERT INTO ride_statuses (id, ride_id, status, created_at) VALUES (?, ?, ?, ?)`,
 		completed.id, rideID, completed.status, completed.createdAt); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-
-	// ベンチマーカーは評価APIの成功直後に支払い済みかを確認するので、決済が完了してから応答する
-	paymentGatewayRequest := &paymentGatewayPostPaymentRequest{
-		Amount: ride.fare(),
-	}
-	if err := requestPaymentGatewayPostPayment(ctx, gatewayURL, token, ride.ID, paymentGatewayRequest); err != nil {
-		if errors.Is(err, erroredUpstream) {
-			writeError(w, http.StatusBadGateway, err)
-			return
-		}
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -624,7 +631,7 @@ func appGetNotification(w http.ResponseWriter, r *http.Request) {
 	response, sent := buildAppNotification(user.ID)
 	if sent != nil {
 		// メモリ上は送信済みにしているので、DB更新に失敗しても通知は返す
-		if _, err := db.ExecContext(ctx, `UPDATE ride_statuses SET app_sent_at = ? WHERE id = ?`, now(), sent.id); err != nil {
+		if _, err := db.ExecContext(context.WithoutCancel(ctx), `UPDATE ride_statuses SET app_sent_at = ? WHERE id = ?`, now(), sent.id); err != nil {
 			slog.Error("failed to update app_sent_at", "error", err)
 		}
 	}
@@ -739,8 +746,11 @@ func appGetNearbyChairs(w http.ResponseWriter, r *http.Request) {
 		nearbyChairs := []appGetNearbyChairsResponseChair{}
 		for _, chair := range chairList {
 			// 稼働中で、前のライドの完了を椅子に通知し終えた椅子だけを返す
-			// COMPLETED になった直後に返すと、ベンチマーカー側で評価の完了処理が終わる前に検証されることがある
 			if !chair.IsActive || !chair.free || chair.activeRides > 0 || !chair.hasLocation {
+				continue
+			}
+			// 評価APIの応答がクライアントに届く前に検証されると「ライド中」と判定されるので、完了直後の椅子はしばらく返さない
+			if chair.latestRide != nil && retrievedAt.Sub(chair.latestRide.UpdatedAt) < nearbyChairsGracePeriod {
 				continue
 			}
 			if calculateDistance(lat, lon, chair.latitude, chair.longitude) <= distance {
