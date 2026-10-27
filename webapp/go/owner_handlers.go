@@ -182,15 +182,15 @@ func ownerGetChairs(w http.ResponseWriter, r *http.Request) {
 		defer mu.RUnlock()
 		for _, chair := range chairsByOwner[owner.ID] {
 			c := ownerGetChairResponseChair{
-				ID:            chair.ID,
-				Name:          chair.Name,
-				Model:         chair.Model,
-				Active:        chair.IsActive,
-				RegisteredAt:  chair.CreatedAt.UnixMilli(),
-				TotalDistance: chair.totalDistance,
+				ID:           chair.ID,
+				Name:         chair.Name,
+				Model:        chair.Model,
+				Active:       chair.IsActive,
+				RegisteredAt: chair.CreatedAt.UnixMilli(),
 			}
-			if chair.hasLocation {
-				t := chair.locationUpdatedAt.UnixMilli()
+			if location := chair.location.Load(); location != nil {
+				c.TotalDistance = location.totalDistance
+				t := location.updatedAt.UnixMilli()
 				c.TotalDistanceUpdatedAt = &t
 			}
 			res.Chairs = append(res.Chairs, c)

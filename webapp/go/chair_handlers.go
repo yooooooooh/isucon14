@@ -1,11 +1,10 @@
 package main
 
 import (
-	"context"
 	"errors"
 	"fmt"
-	"log/slog"
 	"net/http"
+	"sync/atomic"
 
 	"github.com/oklog/ulid/v2"
 )
@@ -70,8 +69,8 @@ func chairPostChairs(w http.ResponseWriter, r *http.Request) {
 				UpdatedAt:   createdAt,
 			},
 			speed: chairModelSpeeds[req.Model],
-			free:  true,
 		}
+		chair.free.Store(true)
 		chairList = append(chairList, chair)
 		chairsByID[chairID] = chair
 		chairsByToken[accessToken] = chair
@@ -104,15 +103,10 @@ func chairPostActivity(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_, err := db.ExecContext(ctx, "UPDATE chairs SET is_active = ? WHERE id = ?", req.IsActive, chair.ID)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-
 	mu.Lock()
 	chair.IsActive = req.IsActive
 	mu.Unlock()
+	enqueueExec("UPDATE chairs SET is_active = ? WHERE id = ?", req.IsActive, chair.ID)
 
 	w.WriteHeader(http.StatusNoContent)
 }
@@ -141,39 +135,41 @@ func chairPostCoordinate(w http.ResponseWriter, r *http.Request) {
 		CreatedAt: recordedAt,
 	})
 
-	// 最新位置と累積移動距離を更新し、乗車位置・目的地への到着を判定する
-	ride, nextStatus := func() (*rideState, string) {
-		mu.Lock()
-		defer mu.Unlock()
+	// 最新位置と累積移動距離を更新する。頻繁に呼ばれるので全体のロックは取らない
+	chair.moveTo(req.Latitude, req.Longitude, recordedAt)
 
-		if chair.hasLocation {
-			chair.totalDistance += calculateDistance(chair.latitude, chair.longitude, req.Latitude, req.Longitude)
-		}
-		chair.hasLocation = true
-		chair.latitude = req.Latitude
-		chair.longitude = req.Longitude
-		chair.locationUpdatedAt = recordedAt
-
-		ride := chair.latestRide
+	// 乗車位置・目的地への到着を判定する。到着したときだけ書き込みロックを取る
+	arrivedStatus := func(ride *rideState) string {
 		if ride == nil {
-			return nil, ""
+			return ""
 		}
 		switch ride.latestStatus() {
 		case "ENROUTE":
 			if req.Latitude == ride.PickupLatitude && req.Longitude == ride.PickupLongitude {
-				return ride, "PICKUP"
+				return "PICKUP"
 			}
 		case "CARRYING":
 			if req.Latitude == ride.DestinationLatitude && req.Longitude == ride.DestinationLongitude {
-				return ride, "ARRIVED"
+				return "ARRIVED"
 			}
 		}
-		return nil, ""
-	}()
-	if ride != nil {
-		if err := addRideStatus(ctx, ride, nextStatus); err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
+		return ""
+	}
+	mu.RLock()
+	arrived := arrivedStatus(chair.latestRide) != ""
+	mu.RUnlock()
+	if arrived {
+		ride, status := func() (*rideState, *rideStatusState) {
+			mu.Lock()
+			defer mu.Unlock()
+			ride := chair.latestRide
+			if next := arrivedStatus(ride); next != "" {
+				return ride, appendRideStatusLocked(ride, next)
+			}
+			return nil, nil
+		}()
+		if status != nil {
+			notifyRide(ride.UserID, ride.ChairID.String)
 		}
 	}
 
@@ -187,11 +183,6 @@ type simpleUser struct {
 	Name string `json:"name"`
 }
 
-type chairGetNotificationResponse struct {
-	Data         *chairGetNotificationResponseData `json:"data"`
-	RetryAfterMs int                               `json:"retry_after_ms"`
-}
-
 type chairGetNotificationResponseData struct {
 	RideID                string     `json:"ride_id"`
 	User                  simpleUser `json:"user"`
@@ -201,68 +192,60 @@ type chairGetNotificationResponseData struct {
 }
 
 func chairGetNotification(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	chair := ctx.Value("chair").(*chairState)
+	chair := r.Context().Value("chair").(*chairState)
 
-	response, sent := buildChairNotification(chair)
-	if sent != nil {
-		// メモリ上は送信済みにしているので、DB更新に失敗しても通知は返す
-		if _, err := db.ExecContext(context.WithoutCancel(ctx), `UPDATE ride_statuses SET chair_sent_at = ? WHERE id = ?`, now(), sent.id); err != nil {
-			slog.Error("failed to update chair_sent_at", "error", err)
+	streamNotifications(w, r, chairNotifier.channel(chair.ID), "chair_sent_at", func(resendLatest bool) (any, *rideStatusState) {
+		data, sent := nextChairNotification(chair, resendLatest)
+		if data == nil {
+			return nil, nil
 		}
-	}
-
-	writeJSON(w, http.StatusOK, response)
+		return data, sent
+	})
 }
 
-// 割り当てられた最新のライドについて、未通知の状態があれば古い順に1つ、無ければ最新の状態を返す
-func buildChairNotification(chair *chairState) (*chairGetNotificationResponse, *rideStatusState) {
-	mu.Lock()
-	defer mu.Unlock()
+// 割り当てられた最新のライドについて、未通知の状態があれば古い順に1つ返して通知済みにする
+// 未通知が無ければ、resendLatest のときだけ最新の状態を返す
+func nextChairNotification(chair *chairState, resendLatest bool) (*chairGetNotificationResponseData, *rideStatusState) {
+	mu.RLock()
+	defer mu.RUnlock()
 
 	ride := chair.latestRide
 	if ride == nil {
-		return &chairGetNotificationResponse{RetryAfterMs: notificationRetryAfterMs}, nil
+		return nil, nil
 	}
 
 	status := ride.latestStatus()
-	var sent *rideStatusState
-	for _, s := range ride.statuses {
-		if !s.chairSent {
-			s.chairSent = true
-			sent = s
-			status = s.status
-			// 完了を椅子に伝えるまでは次のライドを割り当てない
-			if s.status == "COMPLETED" {
-				chair.free = true
-			}
-			break
+	sent := ride.claimUnsentStatus(func(s *rideStatusState) *atomic.Bool { return &s.chairSent })
+	if sent != nil {
+		status = sent.status
+		// 完了を椅子に伝えるまでは次のライドを割り当てない
+		if sent.status == "COMPLETED" {
+			chair.free.Store(true)
 		}
+	} else if !resendLatest {
+		return nil, nil
 	}
 
-	response := &chairGetNotificationResponse{
-		Data: &chairGetNotificationResponseData{
-			RideID: ride.ID,
-			PickupCoordinate: Coordinate{
-				Latitude:  ride.PickupLatitude,
-				Longitude: ride.PickupLongitude,
-			},
-			DestinationCoordinate: Coordinate{
-				Latitude:  ride.DestinationLatitude,
-				Longitude: ride.DestinationLongitude,
-			},
-			Status: status,
+	data := &chairGetNotificationResponseData{
+		RideID: ride.ID,
+		PickupCoordinate: Coordinate{
+			Latitude:  ride.PickupLatitude,
+			Longitude: ride.PickupLongitude,
 		},
-		RetryAfterMs: notificationRetryAfterMs,
+		DestinationCoordinate: Coordinate{
+			Latitude:  ride.DestinationLatitude,
+			Longitude: ride.DestinationLongitude,
+		},
+		Status: status,
 	}
 	if user := usersByID[ride.UserID]; user != nil {
-		response.Data.User = simpleUser{
+		data.User = simpleUser{
 			ID:   user.ID,
 			Name: fmt.Sprintf("%s %s", user.Firstname, user.Lastname),
 		}
 	}
 
-	return response, sent
+	return data, sent
 }
 
 type postChairRidesRideIDStatusRequest struct {
@@ -307,20 +290,14 @@ func chairPostRideStatus(w http.ResponseWriter, r *http.Request) {
 	switch req.Status {
 	// Acknowledge the ride
 	case "ENROUTE":
-		if err := addRideStatus(ctx, ride, "ENROUTE"); err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
+		addRideStatus(ride, "ENROUTE")
 	// After Picking up user
 	case "CARRYING":
 		if status != "PICKUP" {
 			writeError(w, http.StatusBadRequest, errors.New("chair has not arrived yet"))
 			return
 		}
-		if err := addRideStatus(ctx, ride, "CARRYING"); err != nil {
-			writeError(w, http.StatusInternalServerError, err)
-			return
-		}
+		addRideStatus(ride, "CARRYING")
 	default:
 		writeError(w, http.StatusBadRequest, errors.New("invalid status"))
 		return

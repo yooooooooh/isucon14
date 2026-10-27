@@ -4,17 +4,14 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"log/slog"
 	"net/http"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/oklog/ulid/v2"
 )
-
-// 通知エンドポイントのポーリング間隔
-const notificationRetryAfterMs = 30
 
 // ライド完了後、nearby-chairs に椅子を返し始めるまでの猶予
 const nearbyChairsGracePeriod = time.Second
@@ -405,6 +402,7 @@ func appPostRides(w http.ResponseWriter, r *http.Request) {
 	ridesByUser[user.ID] = append(ridesByUser[user.ID], ride)
 	waitingRides = append(waitingRides, ride)
 	mu.Unlock()
+	notifyRide(user.ID, "")
 
 	writeJSON(w, http.StatusAccepted, &appPostRidesResponse{
 		RideID: rideID,
@@ -547,58 +545,26 @@ func appPostRideEvaluatation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 完了時刻は売上集計の基準になるので、決済のリトライを待った後に確定させる
-	// 先に確定すると、売上に反映される前に後続のライドの完了時刻が先行してしまう
-	completed := &rideStatusState{id: ulid.Make().String(), status: "COMPLETED", createdAt: now()}
-
-	tx, err := db.Beginx()
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-	defer tx.Rollback()
-
-	if _, err := tx.ExecContext(
-		ctx,
-		`UPDATE rides SET evaluation = ?, updated_at = ? WHERE id = ?`,
-		req.Evaluation, completed.createdAt, rideID); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-
-	if _, err := tx.ExecContext(
-		ctx,
-		`INSERT INTO ride_statuses (id, ride_id, status, created_at) VALUES (?, ?, ?, ?)`,
-		completed.id, rideID, completed.status, completed.createdAt); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-
-	if err := tx.Commit(); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
-
-	func() {
+	// 完了時刻は売上集計の基準になる。ベンチマーカーは応答を受け取ったライドだけを売上に数えるので、
+	// 決済の後に、売上に反映する瞬間に完了時刻を決め、DBへの記録は待たずに応答する
+	completed := func() *rideStatusState {
 		mu.Lock()
 		defer mu.Unlock()
+		completed := appendRideStatusLocked(ride, "COMPLETED")
 		evaluation := req.Evaluation
 		ride.Evaluation = &evaluation
 		ride.UpdatedAt = completed.createdAt
-		ride.statuses = append(ride.statuses, completed)
 		if chair := chairsByID[ride.ChairID.String]; chair != nil {
 			chair.recordCompletedRide(ride)
 		}
+		return completed
 	}()
+	enqueueExec(`UPDATE rides SET evaluation = ?, updated_at = ? WHERE id = ?`, req.Evaluation, completed.createdAt, rideID)
+	notifyRide(ride.UserID, ride.ChairID.String)
 
 	writeJSON(w, http.StatusOK, &appPostRideEvaluationResponse{
 		CompletedAt: completed.createdAt.UnixMilli(),
 	})
-}
-
-type appGetNotificationResponse struct {
-	Data         *appGetNotificationResponseData `json:"data"`
-	RetryAfterMs int                             `json:"retry_after_ms"`
 }
 
 type appGetNotificationResponseData struct {
@@ -625,59 +591,51 @@ type appGetNotificationResponseChairStats struct {
 }
 
 func appGetNotification(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-	user := ctx.Value("user").(*User)
+	user := r.Context().Value("user").(*User)
 
-	response, sent := buildAppNotification(user.ID)
-	if sent != nil {
-		// メモリ上は送信済みにしているので、DB更新に失敗しても通知は返す
-		if _, err := db.ExecContext(context.WithoutCancel(ctx), `UPDATE ride_statuses SET app_sent_at = ? WHERE id = ?`, now(), sent.id); err != nil {
-			slog.Error("failed to update app_sent_at", "error", err)
+	streamNotifications(w, r, appNotifier.channel(user.ID), "app_sent_at", func(resendLatest bool) (any, *rideStatusState) {
+		data, sent := nextAppNotification(user.ID, resendLatest)
+		if data == nil {
+			return nil, nil
 		}
-	}
-
-	writeJSON(w, http.StatusOK, response)
+		return data, sent
+	})
 }
 
-// 最新のライドについて、未通知の状態があれば古い順に1つ、無ければ最新の状態を返す
-func buildAppNotification(userID string) (*appGetNotificationResponse, *rideStatusState) {
-	mu.Lock()
-	defer mu.Unlock()
+// 最新のライドについて、未通知の状態があれば古い順に1つ返して通知済みにする
+// 未通知が無ければ、resendLatest のときだけ最新の状態を返す
+func nextAppNotification(userID string, resendLatest bool) (*appGetNotificationResponseData, *rideStatusState) {
+	mu.RLock()
+	defer mu.RUnlock()
 
 	rides := ridesByUser[userID]
 	if len(rides) == 0 {
-		return &appGetNotificationResponse{RetryAfterMs: notificationRetryAfterMs}, nil
+		return nil, nil
 	}
 	ride := rides[len(rides)-1]
 
 	status := ride.latestStatus()
-	var sent *rideStatusState
-	for _, s := range ride.statuses {
-		if !s.appSent {
-			s.appSent = true
-			sent = s
-			status = s.status
-			break
-		}
+	sent := ride.claimUnsentStatus(func(s *rideStatusState) *atomic.Bool { return &s.appSent })
+	if sent != nil {
+		status = sent.status
+	} else if !resendLatest {
+		return nil, nil
 	}
 
-	response := &appGetNotificationResponse{
-		Data: &appGetNotificationResponseData{
-			RideID: ride.ID,
-			PickupCoordinate: Coordinate{
-				Latitude:  ride.PickupLatitude,
-				Longitude: ride.PickupLongitude,
-			},
-			DestinationCoordinate: Coordinate{
-				Latitude:  ride.DestinationLatitude,
-				Longitude: ride.DestinationLongitude,
-			},
-			Fare:      ride.fare(),
-			Status:    status,
-			CreatedAt: ride.CreatedAt.UnixMilli(),
-			UpdateAt:  ride.UpdatedAt.UnixMilli(),
+	data := &appGetNotificationResponseData{
+		RideID: ride.ID,
+		PickupCoordinate: Coordinate{
+			Latitude:  ride.PickupLatitude,
+			Longitude: ride.PickupLongitude,
 		},
-		RetryAfterMs: notificationRetryAfterMs,
+		DestinationCoordinate: Coordinate{
+			Latitude:  ride.DestinationLatitude,
+			Longitude: ride.DestinationLongitude,
+		},
+		Fare:      ride.fare(),
+		Status:    status,
+		CreatedAt: ride.CreatedAt.UnixMilli(),
+		UpdateAt:  ride.UpdatedAt.UnixMilli(),
 	}
 
 	if chair := chairsByID[ride.ChairID.String]; ride.ChairID.Valid && chair != nil {
@@ -685,7 +643,7 @@ func buildAppNotification(userID string) (*appGetNotificationResponse, *rideStat
 		if chair.totalRideCount > 0 {
 			stats.TotalEvaluationAvg = float64(chair.totalEvaluation) / float64(chair.totalRideCount)
 		}
-		response.Data.Chair = &appGetNotificationResponseChair{
+		data.Chair = &appGetNotificationResponseChair{
 			ID:    chair.ID,
 			Name:  chair.Name,
 			Model: chair.Model,
@@ -693,7 +651,7 @@ func buildAppNotification(userID string) (*appGetNotificationResponse, *rideStat
 		}
 	}
 
-	return response, sent
+	return data, sent
 }
 
 type appGetNearbyChairsResponse struct {
@@ -746,21 +704,22 @@ func appGetNearbyChairs(w http.ResponseWriter, r *http.Request) {
 		nearbyChairs := []appGetNearbyChairsResponseChair{}
 		for _, chair := range chairList {
 			// 稼働中で、前のライドの完了を椅子に通知し終えた椅子だけを返す
-			if !chair.IsActive || !chair.free || chair.activeRides > 0 || !chair.hasLocation {
+			location := chair.location.Load()
+			if !chair.IsActive || !chair.free.Load() || chair.activeRides > 0 || location == nil {
 				continue
 			}
 			// 評価APIの応答がクライアントに届く前に検証されると「ライド中」と判定されるので、完了直後の椅子はしばらく返さない
 			if chair.latestRide != nil && retrievedAt.Sub(chair.latestRide.UpdatedAt) < nearbyChairsGracePeriod {
 				continue
 			}
-			if calculateDistance(lat, lon, chair.latitude, chair.longitude) <= distance {
+			if calculateDistance(lat, lon, location.latitude, location.longitude) <= distance {
 				nearbyChairs = append(nearbyChairs, appGetNearbyChairsResponseChair{
 					ID:    chair.ID,
 					Name:  chair.Name,
 					Model: chair.Model,
 					CurrentCoordinate: Coordinate{
-						Latitude:  chair.latitude,
-						Longitude: chair.longitude,
+						Latitude:  location.latitude,
+						Longitude: location.longitude,
 					},
 				})
 			}

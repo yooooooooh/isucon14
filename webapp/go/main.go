@@ -10,7 +10,9 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"strconv"
+	"syscall"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -22,6 +24,16 @@ var db *sqlx.DB
 
 func main() {
 	mux := setup()
+
+	// 停止するときは、まだDBへ書き込んでいない変更を書き込んでから終了する
+	go func() {
+		sig := make(chan os.Signal, 1)
+		signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
+		<-sig
+		flushWrites(context.Background())
+		os.Exit(0)
+	}()
+
 	slog.Info("Listening on :8080")
 	http.ListenAndServe(":8080", mux)
 }
@@ -77,7 +89,7 @@ func setup() http.Handler {
 		panic(err)
 	}
 	startMatchingLoop()
-	startChairLocationWriter()
+	startDBWriter()
 
 	mux := chi.NewRouter()
 	mux.Use(middleware.Recoverer)
@@ -144,7 +156,7 @@ func postInitialize(w http.ResponseWriter, r *http.Request) {
 	// 初期化中に配車処理が走らないようにする
 	matchingMu.Lock()
 	defer matchingMu.Unlock()
-	defer lockChairLocationWriterForInitialize()()
+	defer lockDBWriterForInitialize()()
 
 	if out, err := exec.Command("../sql/init.sh").CombinedOutput(); err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Errorf("failed to initialize: %s: %w", string(out), err))

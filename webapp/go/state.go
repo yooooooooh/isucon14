@@ -4,6 +4,7 @@ import (
 	"context"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/oklog/ulid/v2"
@@ -11,6 +12,9 @@ import (
 
 // アプリケーションの状態をメモリに保持する。
 // 書き込みは従来どおりDBにも行い、DBを正として起動時と初期化時にメモリへ再構築する。
+//
+// mu の書き込みロックはすべての読み取りを止めるので、頻繁に更新される値
+// (椅子の現在位置、通知済みフラグ、椅子の空き状態)は atomic にして読み取りロックの下で更新する。
 var (
 	mu sync.RWMutex
 
@@ -35,18 +39,15 @@ type chairState struct {
 	Chair
 	speed int
 
-	hasLocation       bool
-	latitude          int
-	longitude         int
-	totalDistance     int
-	locationUpdatedAt time.Time
+	// 現在位置。まだ位置を送っていなければ nil
+	location atomic.Pointer[chairLocationState]
 
 	// 最後に割り当てられたライド
 	latestRide *rideState
 	// 割り当て済みで COMPLETED になっていないライドの数
 	activeRides int
 	// 割り当てたすべてのライドの完了を椅子へ通知済みで、新しいライドを割り当てられる
-	free bool
+	free atomic.Bool
 
 	// 売上計算用の完了済みライド
 	completedRides []*rideState
@@ -62,12 +63,46 @@ type rideState struct {
 	statuses []*rideStatusState
 }
 
+type chairLocationState struct {
+	latitude      int
+	longitude     int
+	totalDistance int
+	updatedAt     time.Time
+}
+
+// 現在位置を更新し、前回位置からの移動距離を累積する
+func (c *chairState) moveTo(latitude, longitude int, at time.Time) {
+	for {
+		prev := c.location.Load()
+		next := &chairLocationState{latitude: latitude, longitude: longitude, updatedAt: at}
+		if prev != nil {
+			next.totalDistance = prev.totalDistance + calculateDistance(prev.latitude, prev.longitude, latitude, longitude)
+		}
+		if c.location.CompareAndSwap(prev, next) {
+			return
+		}
+	}
+}
+
 type rideStatusState struct {
 	id        string
 	status    string
 	createdAt time.Time
-	appSent   bool
-	chairSent bool
+	appSent   atomic.Bool
+	chairSent atomic.Bool
+}
+
+// 未通知の状態のうち最も古いものを通知済みにして返す。mu の読み取りロックを保持した状態で呼ぶ
+func (r *rideState) claimUnsentStatus(sent func(*rideStatusState) *atomic.Bool) *rideStatusState {
+	for _, s := range r.statuses {
+		if !sent(s).Load() {
+			if sent(s).CompareAndSwap(false, true) {
+				return s
+			}
+			return nil
+		}
+	}
+	return nil
 }
 
 func (r *rideState) latestStatus() string {
@@ -102,20 +137,21 @@ func now() time.Time {
 	return time.Now().Truncate(time.Microsecond)
 }
 
-// ライドの状態遷移をDBに記録してからメモリに反映する
-func addRideStatus(ctx context.Context, ride *rideState, status string) error {
-	s := &rideStatusState{id: ulid.Make().String(), status: status, createdAt: now()}
-	if _, err := db.ExecContext(
-		ctx,
-		"INSERT INTO ride_statuses (id, ride_id, status, created_at) VALUES (?, ?, ?, ?)",
-		s.id, ride.ID, s.status, s.createdAt,
-	); err != nil {
-		return err
-	}
+// ライドの状態遷移をメモリに反映して通知し、DBへの記録は非同期に行う
+func addRideStatus(ride *rideState, status string) {
 	mu.Lock()
-	ride.statuses = append(ride.statuses, s)
+	appendRideStatusLocked(ride, status)
 	mu.Unlock()
-	return nil
+	notifyRide(ride.UserID, ride.ChairID.String)
+}
+
+// mu を保持した状態で呼ぶ
+// 通知済みフラグの更新より先にDBへの記録を予約するため、通知されうる状態になる前に予約する
+func appendRideStatusLocked(ride *rideState, status string) *rideStatusState {
+	s := &rideStatusState{id: ulid.Make().String(), status: status, createdAt: now()}
+	enqueueRideStatus(RideStatus{ID: s.id, RideID: ride.ID, Status: s.status, CreatedAt: s.createdAt})
+	ride.statuses = append(ride.statuses, s)
+	return s
 }
 
 func loadState(ctx context.Context) error {
@@ -186,7 +222,8 @@ func loadState(ctx context.Context) error {
 	newChairsByToken := make(map[string]*chairState, len(chairs))
 	newChairsByOwner := map[string][]*chairState{}
 	for _, c := range chairs {
-		cs := &chairState{Chair: c, speed: newChairModelSpeeds[c.Model], free: true}
+		cs := &chairState{Chair: c, speed: newChairModelSpeeds[c.Model]}
+		cs.free.Store(true)
 		newChairList = append(newChairList, cs)
 		newChairsByID[c.ID] = cs
 		newChairsByToken[c.AccessToken] = cs
@@ -198,13 +235,7 @@ func loadState(ctx context.Context) error {
 		if cs == nil {
 			continue
 		}
-		if cs.hasLocation {
-			cs.totalDistance += calculateDistance(cs.latitude, cs.longitude, l.Latitude, l.Longitude)
-		}
-		cs.hasLocation = true
-		cs.latitude = l.Latitude
-		cs.longitude = l.Longitude
-		cs.locationUpdatedAt = l.CreatedAt
+		cs.moveTo(l.Latitude, l.Longitude, l.CreatedAt)
 	}
 
 	newPaymentTokens := make(map[string]string, len(tokens))
@@ -226,13 +257,10 @@ func loadState(ctx context.Context) error {
 		if rs == nil {
 			continue
 		}
-		rs.statuses = append(rs.statuses, &rideStatusState{
-			id:        s.ID,
-			status:    s.Status,
-			createdAt: s.CreatedAt,
-			appSent:   s.AppSentAt != nil,
-			chairSent: s.ChairSentAt != nil,
-		})
+		status := &rideStatusState{id: s.ID, status: s.Status, createdAt: s.CreatedAt}
+		status.appSent.Store(s.AppSentAt != nil)
+		status.chairSent.Store(s.ChairSentAt != nil)
+		rs.statuses = append(rs.statuses, status)
 	}
 
 	newRidesByUser := map[string][]*rideState{}
@@ -261,10 +289,10 @@ func loadState(ctx context.Context) error {
 		// 6つの状態すべてを椅子へ通知し終えるまでは次のライドを割り当てない
 		allSent := len(rs.statuses) == 6
 		for _, s := range rs.statuses {
-			allSent = allSent && s.chairSent
+			allSent = allSent && s.chairSent.Load()
 		}
 		if !allSent {
-			cs.free = false
+			cs.free.Store(false)
 		}
 	}
 	for _, cs := range newChairList {
