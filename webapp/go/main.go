@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	crand "crypto/rand"
 	"encoding/json"
 	"fmt"
@@ -60,6 +61,8 @@ func setup() http.Handler {
 	dbConfig.ParseTime = true
 	// プレースホルダをクライアント側で展開し、prepare/close の往復をなくす
 	dbConfig.InterpolateParams = true
+	// REPEATABLE READ のギャップロックが coupons への INSERT とデッドロックするので READ COMMITTED にする
+	dbConfig.Params = map[string]string{"transaction_isolation": "'READ-COMMITTED'"}
 
 	_db, err := sqlx.Connect("mysql", dbConfig.FormatDSN())
 	if err != nil {
@@ -69,6 +72,11 @@ func setup() http.Handler {
 	_db.SetMaxOpenConns(100)
 	_db.SetMaxIdleConns(100)
 	db = _db
+
+	if err := loadState(context.Background()); err != nil {
+		panic(err)
+	}
+	startMatchingLoop()
 
 	mux := chi.NewRouter()
 	mux.Use(middleware.Recoverer)
@@ -132,12 +140,21 @@ func postInitialize(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// 初期化中に配車処理が走らないようにする
+	matchingMu.Lock()
+	defer matchingMu.Unlock()
+
 	if out, err := exec.Command("../sql/init.sh").CombinedOutput(); err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Errorf("failed to initialize: %s: %w", string(out), err))
 		return
 	}
 
 	if _, err := db.ExecContext(ctx, "UPDATE settings SET value = ? WHERE name = 'payment_gateway_url'", req.PaymentServer); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+
+	if err := loadState(ctx); err != nil {
 		writeError(w, http.StatusInternalServerError, err)
 		return
 	}
@@ -176,7 +193,7 @@ func writeError(w http.ResponseWriter, statusCode int, err error) {
 	}
 	w.Write(buf)
 
-	slog.Error("error response wrote", err)
+	slog.Error("error response wrote", "error", err)
 }
 
 func secureRandomStr(b int) string {
