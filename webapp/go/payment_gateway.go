@@ -57,7 +57,7 @@ func requestPaymentGatewayPostPayment(ctx context.Context, paymentGatewayURL str
 				if err != nil {
 					return err
 				}
-				defer res.Body.Close()
+				defer getRes.Body.Close()
 
 				// GET /payments は障害と関係なく200が返るので、200以外は回復不能なエラーとする
 				if getRes.StatusCode != http.StatusOK {

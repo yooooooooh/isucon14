@@ -58,15 +58,19 @@ func setup() http.Handler {
 	dbConfig.Net = "tcp"
 	dbConfig.DBName = dbname
 	dbConfig.ParseTime = true
+	// プレースホルダをクライアント側で展開し、prepare/close の往復をなくす
+	dbConfig.InterpolateParams = true
 
 	_db, err := sqlx.Connect("mysql", dbConfig.FormatDSN())
 	if err != nil {
 		panic(err)
 	}
+	// 既定の MaxIdleConns(2) だと接続の張り直しでエフェメラルポートが枯渇する
+	_db.SetMaxOpenConns(100)
+	_db.SetMaxIdleConns(100)
 	db = _db
 
 	mux := chi.NewRouter()
-	mux.Use(middleware.Logger)
 	mux.Use(middleware.Recoverer)
 	mux.HandleFunc("POST /api/initialize", postInitialize)
 
