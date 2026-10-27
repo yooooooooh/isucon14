@@ -77,6 +77,7 @@ func setup() http.Handler {
 		panic(err)
 	}
 	startMatchingLoop()
+	startChairLocationWriter()
 
 	mux := chi.NewRouter()
 	mux.Use(middleware.Recoverer)
@@ -143,6 +144,7 @@ func postInitialize(w http.ResponseWriter, r *http.Request) {
 	// 初期化中に配車処理が走らないようにする
 	matchingMu.Lock()
 	defer matchingMu.Unlock()
+	defer lockChairLocationWriterForInitialize()()
 
 	if out, err := exec.Command("../sql/init.sh").CombinedOutput(); err != nil {
 		writeError(w, http.StatusInternalServerError, fmt.Errorf("failed to initialize: %s: %w", string(out), err))

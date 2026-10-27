@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -131,14 +132,14 @@ func chairPostCoordinate(w http.ResponseWriter, r *http.Request) {
 	chair := ctx.Value("chair").(*chairState)
 	recordedAt := now()
 
-	if _, err := db.ExecContext(
-		ctx,
-		`INSERT INTO chair_locations (id, chair_id, latitude, longitude, created_at) VALUES (?, ?, ?, ?, ?)`,
-		ulid.Make().String(), chair.ID, req.Latitude, req.Longitude, recordedAt,
-	); err != nil {
-		writeError(w, http.StatusInternalServerError, err)
-		return
-	}
+	// 椅子はこのAPIが応答するまで次の移動に進めないので、DBへの記録はまとめて非同期に行う
+	enqueueChairLocation(ChairLocation{
+		ID:        ulid.Make().String(),
+		ChairID:   chair.ID,
+		Latitude:  req.Latitude,
+		Longitude: req.Longitude,
+		CreatedAt: recordedAt,
+	})
 
 	// 最新位置と累積移動距離を更新し、乗車位置・目的地への到着を判定する
 	ride, nextStatus := func() (*rideState, string) {
@@ -206,7 +207,7 @@ func chairGetNotification(w http.ResponseWriter, r *http.Request) {
 	response, sent := buildChairNotification(chair)
 	if sent != nil {
 		// メモリ上は送信済みにしているので、DB更新に失敗しても通知は返す
-		if _, err := db.ExecContext(ctx, `UPDATE ride_statuses SET chair_sent_at = ? WHERE id = ?`, now(), sent.id); err != nil {
+		if _, err := db.ExecContext(context.WithoutCancel(ctx), `UPDATE ride_statuses SET chair_sent_at = ? WHERE id = ?`, now(), sent.id); err != nil {
 			slog.Error("failed to update chair_sent_at", "error", err)
 		}
 	}
